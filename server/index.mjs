@@ -1,12 +1,15 @@
 import { createServer } from "node:http";
-import { createReadStream, readFileSync, existsSync } from "node:fs";
+import { createReadStream, readFileSync, existsSync, statSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { resolve } from "node:path";
+import { extname, resolve, sep } from "node:path";
 import { ageAt, featuresFor, positionBucket, predictValue, roleGradeFeatures, transferGroupKeys } from "./model.mjs";
 import { loadRoleGrades } from "./role-grades.mjs";
 
-const root = resolve("data");
-const port = Number(process.env.API_PORT || 3001);
+const root = resolve(process.env.DATA_DIR || "data");
+const staticRoot = resolve(process.env.STATIC_DIR || "dist");
+const port = Number(process.env.PORT || process.env.API_PORT || 3001);
+const host = process.env.HOST || (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
+const modelPath = resolve(process.env.MODEL_PATH || "artifacts/market-value-model.json");
 let players = [];
 let ids = new Map();
 let history = new Map();
@@ -25,6 +28,8 @@ let seasonPerformanceReady = false;
 let seasonPerformanceMessage = "";
 let model = null;
 let modelMessage = "";
+let competitionNameByCode = new Map();
+let filterOptions = { positions: [], leagues: [] };
 
 function parseLine(line) {
   const out = [];
@@ -57,7 +62,7 @@ function readCsv(file) {
 function ageOf(player) {
   const birth = new Date(player.date_of_birth);
   if (!player.date_of_birth || Number.isNaN(+birth)) return null;
-  const target = new Date("2026-07-01T00:00:00Z");
+  const target = new Date();
   let age = target.getUTCFullYear() - birth.getUTCFullYear();
   if (target.getUTCMonth() < birth.getUTCMonth() || (target.getUTCMonth() === birth.getUTCMonth() && target.getUTCDate() < birth.getUTCDate())) age--;
   return age;
@@ -177,33 +182,48 @@ async function loadSeasonPerformance() {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, OPTIONS" });
   res.end(JSON.stringify(body));
 }
+function serveBuiltApp(pathname, res) {
+  let decoded;
+  try { decoded = decodeURIComponent(pathname); } catch { return send(res, 400, { error: "invalid_path" }); }
+  const candidate = resolve(staticRoot, "." + decoded);
+  if (candidate !== staticRoot && !candidate.startsWith(staticRoot + sep)) return send(res, 400, { error: "invalid_path" });
+  const file = existsSync(candidate) && statSync(candidate).isFile() ? candidate : resolve(staticRoot, "index.html");
+  if (!existsSync(file)) return send(res, 503, { error: "frontend_unavailable", message: "Run npm run build before starting the production server." });
+  const types = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp", ".ico": "image/x-icon" };
+  res.writeHead(200, { "Content-Type": types[extname(file).toLowerCase()] || "application/octet-stream", "Cache-Control": file.endsWith("index.html") ? "no-cache" : "public, max-age=31536000, immutable" });
+  createReadStream(file).on("error", () => { if (!res.headersSent) res.writeHead(500); res.end(); }).pipe(res);
+}
 
 const server = createServer((req, res) => {
   if (req.method === "OPTIONS") { res.writeHead(204, { "Access-Control-Allow-Origin": "*" }); return res.end(); }
   const url = new URL(req.url, "http://localhost");
   if (url.pathname === "/api/health") return send(res, 200, { ok: true, datasetLoaded: ready, players: players.length, appearancesLoaded: statsReady, seasonPerformanceLoaded: seasonPerformanceReady, seasonPerformanceMessage: seasonPerformanceMessage || null, modelLoaded: Boolean(model), modelVersion: model?.version || null, transfersLoaded: transfersReady, transferMessage: transferMessage || null, message: message || null, modelMessage: modelMessage || null });
-  if (!url.pathname.startsWith("/api/")) return send(res, 404, { error: "not_found" });
+  if (!url.pathname.startsWith("/api/") && url.pathname !== "/api") return process.env.NODE_ENV === "production" ? serveBuiltApp(url.pathname, res) : send(res, 404, { error: "not_found" });
   if (!ready) return send(res, 503, { error: "dataset_unavailable", message });
+  if (url.pathname === "/api/filter-options") return send(res, 200, filterOptions);
   const parts = url.pathname.slice(5).split("/").filter(Boolean).map(decodeURIComponent);
   if (parts[0] !== "players") return send(res, 404, { error: "not_found" });
   if (parts.length === 1) {
     const query = (url.searchParams.get("q") || "").toLowerCase();
     const position = (url.searchParams.get("position") || "").toLowerCase();
     const club = (url.searchParams.get("club") || "").toLowerCase();
+    const league = (url.searchParams.get("league") || "").toLowerCase();
     let result = players.filter(player => {
       const text = [player.name, player.player_code, player.current_club_name, player.position, player.sub_position].join(" ").toLowerCase();
       const age = ageOf(player);
       return (!query || text.includes(query)) &&
         (!position || (player.position || "").toLowerCase().includes(position)) &&
         (!club || (player.current_club_name || "").toLowerCase().includes(club)) &&
+        (!league || [player.current_club_domestic_competition_id, competitionNameByCode.get(player.current_club_domestic_competition_id)].join(" ").toLowerCase().includes(league)) &&
         (!url.searchParams.has("minAge") || (age !== null && age >= Number(url.searchParams.get("minAge")))) &&
         (!url.searchParams.has("maxAge") || (age !== null && age <= Number(url.searchParams.get("maxAge"))));
     });
-    const sort = url.searchParams.get("sort");
-    result.sort((a, b) => sort === "market_value"
-      ? Number(b.market_value_in_eur || 0) - Number(a.market_value_in_eur || 0)
+    const sort = url.searchParams.get("sort") || "name";
+    const direction = url.searchParams.get("order") === "desc" ? -1 : 1;
+    result.sort((a, b) => direction * (sort === "market_value"
+      ? Number(a.market_value_in_eur || 0) - Number(b.market_value_in_eur || 0)
       : sort === "age" ? (ageOf(a) ?? 999) - (ageOf(b) ?? 999)
-      : String(a.name || "").localeCompare(String(b.name || "")));
+      : String(a.name || "").localeCompare(String(b.name || ""))));
     const total = result.length;
     const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 40)));
     const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
@@ -268,20 +288,28 @@ server.on("error", error => {
   console.error("API server could not start on port " + port + ": " + error.message + ". Stop the other API process or set API_PORT to a free port.");
   process.exitCode = 1;
 });
-server.listen(port, "127.0.0.1", () => console.log("API at http://localhost:" + port + "/api; health at /api/health"));
+server.listen(port, host, () => console.log("Touchline server at http://" + host + ":" + port + "; health at /api/health"));
 
 async function start() {
   try {
     players = readCsv("players.csv");
     const valuations = readCsv("player_valuations.csv");
     try {
-      model = JSON.parse(readFileSync(resolve("artifacts/market-value-model.json"), "utf8"));
+      model = JSON.parse(readFileSync(modelPath, "utf8"));
       console.log("Loaded model " + model.version);
     } catch (error) {
       modelMessage = "Model artifact unavailable: " + error.message + ". Run npm run train:model.";
       console.warn(modelMessage);
     }
     ids = new Map(players.map(player => [String(player.player_id), player]));
+    try {
+      const competitions = readCsv("competitions.csv");
+      competitionNameByCode = new Map(competitions.filter(row => row.domestic_league_code).map(row => [row.domestic_league_code, row.name || row.competition_code || row.domestic_league_code]));
+    } catch { competitionNameByCode = new Map(); }
+    filterOptions = {
+      positions: [...new Set(players.map(player => player.position).filter(Boolean))].sort((a, b) => a.localeCompare(b)),
+      leagues: [...new Set(players.map(player => player.current_club_domestic_competition_id).filter(Boolean))].map(code => ({ code, name: competitionNameByCode.get(code) || code })).sort((a, b) => a.name.localeCompare(b.name)),
+    };
     playerRoleGrades = loadRoleGrades(root, ids);
     for (const row of valuations) {
       const key = String(row.player_id);

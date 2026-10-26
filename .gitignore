@@ -5,3 +5,5 @@ data/
 *.csv
 *.zip
 *.gz
+storage/
+.env.local

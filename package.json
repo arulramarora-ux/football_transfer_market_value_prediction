@@ -1,1 +1,21 @@
-{"name":"football-market-value-predictor","private":true,"version":"0.1.0","type":"module","scripts":{"dev":"node scripts/dev.mjs","build":"vite build","train:model":"node scripts/train-model.mjs","api":"node server/index.mjs"},"dependencies":{"react":"latest","react-dom":"latest","vite":"latest"}}
+{
+  "name": "football-market-value-predictor",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "vite build",
+    "train:model": "node scripts/train-model.mjs",
+    "api": "node server/index.mjs",
+    "start": "node server/index.mjs",
+    "import:neon": "node scripts/import-neon.mjs"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.2.0",
+    "csv-parse": "^7.0.3",
+    "react": "latest",
+    "react-dom": "latest",
+    "vite": "latest"
+  }
+}

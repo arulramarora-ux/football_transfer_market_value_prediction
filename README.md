@@ -1,23 +1,25 @@
 # Touchline — Football Player Market Value Predictor
 
-Run npm install once. Download the Kaggle dataset and copy players.csv and player_valuations.csv into this project's data folder, then run npm run dev. This starts the local Node API and Vite website together; open the URL printed by Vite (usually http://localhost:5173). Check http://localhost:3001/api/health for dataset status. Ctrl+C stops both.
+Touchline is a React/Vite scouting interface with a Node.js API and a 120-day relative-change ridge model.
 
-API endpoints: GET /api/health, /api/players?q=&limit=&offset=&sort=name|age|market_value, /api/players/:id, /api/players/:id/value-history, and /api/players/:id/prediction. Position, club, and age query filters are supported.
+## Local development
 
-Dataset: https://www.kaggle.com/datasets/davidcariboo/player-scores. Raw CSVs are gitignored. Without them, the API reports dataset_unavailable and returns no invented data. The maintainer reports valuation observations through 12 June 2026, so validate the July target snapshot: https://github.com/dcaribou/transfermarkt-datasets.
+```powershell
+cd C:\Users\Arul\Downloads\football_transfer_market_value_predictor
+npm install
+npm run dev
+```
 
-A 120-day ridge-regression model is active: it starts from the latest recorded market value and estimates a change using player age, position, valuation trend, recent performance, cumulative career-to-date appearances, goals, assists, minutes and cards, completed-season performance, role-specific FBref grades from the latest completed season and recency-weighted last two seasons, and comparable transfer history. Grades use within-position season percentiles and expose coverage because the 2025–26 file omits some passing and defensive tables. Performance effects are also learned separately by broad position through position-by-stat interactions. This horizon places the latest dataset valuation date (June 12, 2026) on October 10, 2026. It is an estimate, not proof of accuracy. It predicts a future recorded market valuation, not a transfer fee or guaranteed sale price. Keep recorded values, model estimates, and transfer fees distinct.
-Visual direction: Dot Field hero backdrop, live metric cards based only on returned player records, split-pill navigation treatment, dynamic homepage copy, particle-style action feedback, and persistent light/dark switch. Sidewave is the provisional visual reference; no Watermelon UI source link was provided.
-## Local API startup
+Open the Vite URL in the terminal (normally `http://localhost:5173`). The local API runs at `http://localhost:3001/api`; check `/api/health` for readiness and model version.
 
-Download and extract the Kaggle dataset; put players.csv and player_valuations.csv in the data folder. Run npm install once, then npm run dev. This starts the API and Vite together. Open the Vite URL (usually http://localhost:5173); check http://localhost:3001/api/health for dataset status. Ctrl+C stops both.
+Place the Kaggle source files in `data/` for local development. Required files include `players.csv` and `player_valuations.csv`; appearances, performances, transfers, competitions, and season-stat CSVs enrich stats and model features. Raw datasets are gitignored.
 
-API routes: GET /api/health, /api/players, /api/players/:id, /api/players/:id/value-history, and /api/players/:id/prediction. Without the CSV files it reports dataset_unavailable; no fake data is returned.
+Train locally with `npm run train:model`; build the frontend with `npm run build`.
 
-For player overall stats, also add appearances.csv to data. The API aggregates match appearances, goals, assists, minutes, and cards from that file; totals are explicitly labeled as dataset coverage, not guaranteed full-career totals.
+## Deployment target: Vercel + Neon
 
-## Train the baseline model
+React is already the frontend. `vercel.json` configures SPA fallback, and `database/schema.sql` is the initial Neon PostgreSQL schema. A Vercel Node.js catch-all API supports health, search, player records, history, stats, and prediction. The import script aggregates CSV data before loading it into Neon. Create a fresh Neon project, copy `.env.example` to `.env`, fill in the Neon connection URL, then run `npm run import:neon` to create/populate the schema and tables.
 
-With `players.csv`, `player_valuations.csv`, `appearances.csv`, and `player_performances.csv` in `data/`, run `npm run train:model` from this project directory. The script creates `artifacts/market-value-model.json`. It trains for 120 days by default on historical valuation snapshots and evaluates one latest forecast per player in the final year of available target data. Training labels end before the forecast cutoff, and holdout snapshots begin at or after it; this avoids future-label leakage. The artifact stores the cutoff, data ranges, error metrics, and carry-forward comparison. Run this again after updating the dataset, then restart the API so it loads the refreshed artifact. The API health response reports whether the model loaded, and each player profile shows the valuation date used and the forecast date.
+After importing the data, connect the GitHub repository to Vercel and set the pooled Neon connection string as the private Vercel environment variable `DATABASE_URL`. Never put database credentials in frontend `VITE_` variables or Git. The local API continues to be used by `npm run dev`; the Vercel functions serve the production API. The importer clears the target tables before each full import, so only run it against the intended database.
 
-The active prediction strategy uses ridge regression to estimate a value change from the current recorded value using the listed features. The training script reports its temporal holdout error and the carry-forward baseline for comparison. Appearance, performance, and transfer CSVs may remain useful to the site stats pages or future model experiments; Matches.csv is currently unused. Trophy features are not included. The output remains a future market-value estimate, not a transfer-fee estimate. Check the holdout comparison in the model artifact before relying on estimates.
+Sign-in, saved items, and admin workflows are deferred. The player profile hides the recorded-value card/history by request; recorded values still anchor the forecast internally.
