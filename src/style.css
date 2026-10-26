@@ -72,3 +72,4 @@ nav a:hover,nav a:focus-visible{background:#1c3159;color:#b9d7ff}
 .compare-slot-player{display:flex;align-items:center;gap:15px;margin-top:18px}.compare-slot-player h2{margin:0}.compare-photo{width:76px;height:76px;border-radius:50%;flex:none;font-size:22px}.compare-slot-player>div{min-width:0}
 
 .dial-number{display:inline-block;font-variant-numeric:tabular-nums;white-space:nowrap}
+.valuecols{grid-template-columns:1fr}

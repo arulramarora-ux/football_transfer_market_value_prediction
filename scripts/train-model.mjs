@@ -1,7 +1,7 @@
 import { createReadStream, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { resolve } from "node:path";
-import { FEATURE_NAMES, HORIZON_DAYS, ageAt, featuresFor, predictLogValue, transferGroupKeys } from "../server/model.mjs";
+import { FEATURE_NAMES, HORIZON_DAYS, ageAt, featuresFor, predictLogValue, transferGroupKeys, valueBand } from "../server/model.mjs";
 import { loadRoleGrades } from "../server/role-grades.mjs";
 
 const dataDir = resolve("data");
@@ -190,7 +190,7 @@ for (const [playerId, history] of histories) {
     const sourceIndex = history.lastIndexOf(values[i]);
     const snapshotFeatures = featuresFor(player, history.slice(0, sourceIndex + 1), appearanceMonths.get(playerId), transferBins, playerTransferBins, playerSeasons.get(playerId), playerRoleGrades.get(playerId));
     if (!snapshotFeatures) continue;
-    const y = Math.log(Number(target.market_value_in_eur));
+    const y = Math.log(Number(target.market_value_in_eur) / snapshotFeatures.currentValue);
     if (!Number.isFinite(y)) continue;
     examples.push({ playerId, x: snapshotFeatures.values, y, targetValue: Number(target.market_value_in_eur), sourceValue: snapshotFeatures.currentValue, sourceDate: snapshotFeatures.current.date, targetDate: target.date, horizonDays: Math.round((Date.parse(target.date) - Date.parse(snapshotFeatures.current.date)) / DAY) });
   }
@@ -199,8 +199,9 @@ examples.sort((a, b) => a.sourceDate.localeCompare(b.sourceDate));
 if (examples.length < 1000) throw new Error(`Only ${examples.length} training examples were created; need at least 1,000. Check valuation dates and player metadata.`);
 // Backtest the final year of observed targets. At the cutoff, all training labels are
 // already known; each forecast snapshot is strictly after the cutoff.
-const cutoff = new Date(Date.parse(latestValuationDate) - forecastHorizonDays * DAY).toISOString().slice(0, 10);
-const latestEligibleHoldoutSourceDate = new Date(Date.parse(latestValuationDate) - (forecastHorizonDays - targetToleranceDays) * DAY).toISOString().slice(0, 10);
+const validationAsOf = process.env.MODEL_VALIDATION_AS_OF || latestValuationDate;
+const cutoff = new Date(Date.parse(validationAsOf) - forecastHorizonDays * DAY).toISOString().slice(0, 10);
+const latestEligibleHoldoutSourceDate = new Date(Date.parse(validationAsOf) - (forecastHorizonDays - targetToleranceDays) * DAY).toISOString().slice(0, 10);
 const train = examples.filter(row => row.targetDate < cutoff);
 const holdoutByPlayer = new Map();
 for (const row of examples) {
@@ -211,10 +212,28 @@ for (const row of examples) {
 const holdout = [...holdoutByPlayer.values()];
 if (train.length < 500 || holdout.length < 100) throw new Error(`Temporal split too small: ${train.length} train, ${holdout.length} unique-player holdout.`);
 const model = fit(train);
-// Keep the best evaluated baseline active: predict no change over the horizon.
-model.predictionStrategy = "ridge";
+model.predictionStrategy = "ridge-relative";
+function quantile(sorted, probability) {
+  if (!sorted.length) return 0;
+  const index = (sorted.length - 1) * probability, lower = Math.floor(index), fraction = index - lower;
+  return sorted[lower] * (1 - fraction) + sorted[Math.min(lower + 1, sorted.length - 1)] * fraction;
+}
+function changeBoundsFor(rows) {
+  const changesByBand = new Map(["under_1m", "1m_5m", "5m_20m", "20m_50m", "50m_plus", "all"].map(band => [band, []]));
+  for (const row of rows) {
+    changesByBand.get("all").push(row.y);
+    changesByBand.get(valueBand(row.sourceValue)).push(row.y);
+  }
+  const all = changesByBand.get("all").sort((a, b) => a - b);
+  return Object.fromEntries([...changesByBand].map(([band, changes]) => {
+    const sorted = changes.sort((a, b) => a - b), source = sorted.length >= 30 ? sorted : all;
+    return [band, { examples: sorted.length, lowerLogChange: quantile(source, 0.05), upperLogChange: quantile(source, 0.95) }];
+  }));
+}
+model.changeBounds = changeBoundsFor(train);
 const evaluated = holdout.map(row => {
-  const predicted = Math.exp(predictLogValue(model, row.x));
+  const logPredicted = predictLogValue(model, row.x);
+  const predicted = Math.exp(Math.max(Math.log(1000), Math.min(Math.log(300_000_000), logPredicted)));
   const actual = row.targetValue;
   const absPct = Math.abs(predicted - actual) / actual;
   const symmetricPct = 2 * Math.abs(predicted - actual) / (predicted + actual);
@@ -254,8 +273,8 @@ for (const row of evaluated) {
   const year = row.targetDate.slice(0, 4);
   (byTargetYear[year] ||= []).push(row);
 }
-const byValueBand = { under_1m: [], "1m_to_10m": [], "10m_plus": [] };
-for (const row of evaluated) byValueBand[row.targetValue < 1_000_000 ? "under_1m" : row.targetValue < 10_000_000 ? "1m_to_10m" : "10m_plus"].push(row);
+const byValueBand = { under_1m: [], "1m_to_10m": [], "10m_to_50m": [], "50m_plus": [] };
+for (const row of evaluated) byValueBand[row.targetValue < 1_000_000 ? "under_1m" : row.targetValue < 10_000_000 ? "1m_to_10m" : row.targetValue < 50_000_000 ? "10m_to_50m" : "50m_plus"].push(row);
 const asPercentMetrics = summary => ({
   examples: summary.examples,
   meanAbsolutePercentageErrorPercent: summary.meanAbsolutePercentageError * 100,
@@ -279,22 +298,27 @@ const metrics = {
   medianForecastToSourceValueRatio: median(forecastToSourceRatios),
   meanActualToSourceValueRatio: mean(actualToSourceRatios),
   byTargetYear: Object.fromEntries(Object.entries(byTargetYear).map(([year, rows]) => [year, asPercentMetrics(summarize(rows))])),
-  byTargetValueBand: Object.fromEntries(Object.entries(byValueBand).map(([band, rows]) => [band, rows.length ? asPercentMetrics(summarize(rows)) : { examples: 0 }])),
+  byTargetValueBand: Object.fromEntries(Object.entries(byValueBand).map(([band, rows]) => [band, rows.length ? { ...asPercentMetrics(summarize(rows)), carryForwardMeanAbsolutePercentageErrorPercent: mean(rows.map(r => Math.abs(r.sourceValue - r.targetValue) / r.targetValue)) * 100 } : { examples: 0 }])),
 };
+const deploymentModel = fit(examples);
+deploymentModel.predictionStrategy = "ridge-relative";
+deploymentModel.changeBounds = changeBoundsFor(examples);
 const artifact = {
-  version: `ridge-${forecastHorizonDays}d-v9-position-grades`,
-  predictionStrategy: "ridge",
+  version: `ridge-relative-${forecastHorizonDays}d-v10-bounded-change`,
+  predictionStrategy: "ridge-relative",
   horizonDays: forecastHorizonDays,
   featureNames: FEATURE_NAMES,
-  ...model,
+  ...deploymentModel,
   trainedAt: new Date().toISOString(),
   training: {
     source: "Transfermarkt player-scores Kaggle dataset",
-    target: `nearest recorded market value within ±${targetToleranceDays} days of ${forecastHorizonDays} days after snapshot`,
-    features: "log current value, age, position, prior value trend, previous 12 complete months of performance, career-to-date stats, latest completed season performance, FBref role-specific performance grades from the latest completed season and recency-weighted last two seasons with data-coverage indicators, position-by-stat interactions, and prior comparable transfer fee-to-market ratios",
-    splitMethod: "final-year backtest; training labels end before cutoff; one latest holdout snapshot per player starts at or after cutoff",
+    target: `bounded log change from snapshot value to nearest recorded value within ±${targetToleranceDays} days of ${forecastHorizonDays} days after snapshot`,
+    features: "age, position, valuation trend, recent and career performance stats, completed-season stats, position-specific FBref grades from the latest two completed seasons, position-stat interactions, and comparable transfer ratios; predicts a log change from current value with source-value-band historical bounds; rare availability and missing-comparison flags are excluded",
+    splitMethod: "chronological backtest; training labels end before cutoff; one latest holdout snapshot per player starts at or after cutoff",
+    validationAsOf,
     uniquePlayerHoldout: true,
     trainingRows: train.length,
+    deploymentRows: examples.length,
     holdoutRows: holdout.length,
     holdoutPlayers: holdout.length,
     latestDatasetValuationDate: latestValuationDate,

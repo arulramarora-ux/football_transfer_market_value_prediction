@@ -19,31 +19,25 @@ export const FEATURE_NAMES = [
   "goals_previous_12_full_months",
   "assists_previous_12_full_months",
   "minutes_previous_12_full_months",
-  "appearance_history_available",
   "career_appearances_before_source_month",
   "career_goals_before_source_month",
   "career_assists_before_source_month",
   "career_minutes_before_source_month",
   "career_yellow_cards_before_source_month",
   "career_red_cards_before_source_month",
-  "career_history_available",
   "last_completed_season_appearances",
   "last_completed_season_goals",
   "last_completed_season_assists",
   "last_completed_season_minutes",
   "last_completed_season_clean_sheets",
   "last_completed_season_goals_conceded",
-  "completed_season_performance_available",
   "latest_completed_position_grade",
   "last_two_seasons_position_grade",
   "latest_position_grade_coverage",
   "two_season_position_grade_coverage",
-  "position_grade_seasons_available",
   ...POSITION_GROUPS.flatMap(position => POSITION_STAT_NAMES.map(stat => `${position}_${stat}`)),
   "comparable_transfer_log_fee_to_value_ratio",
   "log1p_comparable_transfer_count",
-  "transfer_comparables_available",
-  "transfer_comparable_specificity",
 ];
 const DAY = 86_400_000;
 const VALUE_TREND_LOOKBACK_DAYS = 365;
@@ -71,7 +65,7 @@ function ageBand(age) {
   if (age < 29) return "25_28";
   return "29_plus";
 }
-function valueBand(value) {
+export function valueBand(value) {
   if (value < 1_000_000) return "under_1m";
   if (value < 5_000_000) return "1m_5m";
   if (value < 20_000_000) return "5m_20m";
@@ -100,10 +94,10 @@ function previousTwelveMonths(sourceDate, monthlyStats) {
       for (const key of Object.keys(totals)) totals[key] += month[key] || 0;
     }
   }
-  return [totals.appearances, totals.goals, totals.assists, totals.minutes_played, Number(Boolean(monthlyStats))];
+  return [totals.appearances, totals.goals, totals.assists, totals.minutes_played];
 }
 function careerStatsToDate(sourceDate, monthlyStats) {
-  if (!monthlyStats) return [0, 0, 0, 0, 0, 0, 0];
+  if (!monthlyStats) return [0, 0, 0, 0, 0, 0];
   const target = new Date(sourceDate + "T00:00:00Z");
   const currentMonth = target.getUTCFullYear() * 12 + target.getUTCMonth();
   const totals = { appearances: 0, goals: 0, assists: 0, minutes_played: 0, yellow_cards: 0, red_cards: 0 };
@@ -111,14 +105,14 @@ function careerStatsToDate(sourceDate, monthlyStats) {
     if (monthIndex >= currentMonth) continue;
     for (const key of Object.keys(totals)) totals[key] += month[key] || 0;
   }
-  return [totals.appearances, totals.goals, totals.assists, totals.minutes_played, totals.yellow_cards, totals.red_cards, 1];
+  return [totals.appearances, totals.goals, totals.assists, totals.minutes_played, totals.yellow_cards, totals.red_cards];
 }
 export function roleGradeFeatures(sourceDate, playerRoleGrades) {
   const sourceMs = dateMs(sourceDate);
   const completed = playerRoleGrades
     ? [...playerRoleGrades.entries()].filter(([endMs, grade]) => endMs <= sourceMs && Number.isFinite(grade.grade)).sort((a, b) => a[0] - b[0]).slice(-2).reverse().map(([, grade]) => grade)
     : [];
-  if (!completed.length) return [50, 50, 0, 0, 0];
+  if (!completed.length) return [50, 50, 0, 0];
   const latest = completed[0];
   let scoreSum = 0, weightSum = 0, coverageSum = 0;
   const recencyWeights = [0.65, 0.35];
@@ -130,7 +124,7 @@ export function roleGradeFeatures(sourceDate, playerRoleGrades) {
   });
   const overall = weightSum ? scoreSum / weightSum : 50;
   const coverageDenominator = recencyWeights.slice(0, completed.length).reduce((a, b) => a + b, 0);
-  return [latest.grade, overall, latest.coverage, coverageSum / coverageDenominator, completed.length];
+  return [latest.grade, overall, latest.coverage, coverageSum / coverageDenominator];
 }
 function positionPerformanceInteractions(bucket, recent, career, season) {
   const stats = [
@@ -150,11 +144,11 @@ function completedSeasonStats(sourceDate, playerSeasons) {
       if (seasonEndMs <= sourceMs && (!latest || seasonEndMs > latest.seasonEndMs)) latest = { seasonEndMs, totals };
     }
   }
-  if (!latest) return [0, 0, 0, 0, 0, 0, 0];
+  if (!latest) return [0, 0, 0, 0, 0, 0];
   const t = latest.totals;
-  return [t.appearances, t.goals, t.assists, t.minutes_played, t.clean_sheets, t.goals_conceded, 1];
+  return [t.appearances, t.goals, t.assists, t.minutes_played, t.clean_sheets, t.goals_conceded];
 }function transferFeatures(sourceDate, player, age, value, bins, playerBins) {
-  if (!bins) return [0, 0, 0, 0];
+  if (!bins) return [0, 0];
   const current = new Date(sourceDate + "T00:00:00Z");
   const currentMonth = current.getUTCFullYear() * 12 + current.getUTCMonth();
 const groups = transferGroupKeys(player, age, value);
@@ -177,12 +171,10 @@ const groups = transferGroupKeys(player, age, value);
     if (candidate.count >= minimumCounts[i]) { chosen = candidate; specificity = groups.length - i - 1; break; }
     if (candidate.count > chosen.count) { chosen = candidate; specificity = groups.length - i - 1; }
   }
-  if (!chosen.count) return [0, 0, 0, 0];
+  if (!chosen.count) return [0, 0];
   return [
     clamp(chosen.logRatioSum / chosen.count, -2.3, 2.3),
     Math.log1p(chosen.count),
-    1,
-    specificity,
   ];
 }
 export function featuresFor(player, records, monthlyStats, transferBins, playerTransferBins, playerSeasons, playerRoleGrades) {
@@ -237,6 +229,14 @@ export function predictLogValue(model, values) {
   let result = model.intercept;
   for (let i = 0; i < values.length; i++) {
     result += model.coefficients[i] * ((values[i] - model.means[i]) / model.scales[i]);
+  }
+  if (model.predictionStrategy === "ridge-relative") {
+    const band = valueBand(Math.exp(values[0]));
+    const bounds = model.changeBounds?.[band] || model.changeBounds?.all;
+    if (bounds && Number.isFinite(bounds.lowerLogChange) && Number.isFinite(bounds.upperLogChange)) {
+      result = clamp(result, bounds.lowerLogChange, bounds.upperLogChange);
+    }
+    return values[0] + result;
   }
   return result;
 }
